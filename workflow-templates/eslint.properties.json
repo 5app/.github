@@ -1,0 +1,11 @@
+{
+    "name": "5App ESLint Workflow",
+    "description": "Static code checking",
+    "iconName": "eslint-logo",
+    "categories": [
+        "JavaScript"
+    ],
+    "filePatterns": [
+        "package.json$",
+    ]
+}
