@@ -1,4 +1,4 @@
 # .github
 Shared Workflows
 
-See https://docs.github.com/en/actions/learn-github-actions/sharing-workflows-with-your-organization on how this is used to share workflows across the organization
+With an Enterprize plan this allows us to share actions across our organization, see [Shared Workflows](https://docs.github.com/en/actions/learn-github-actions/sharing-workflows-with-your-organization)
