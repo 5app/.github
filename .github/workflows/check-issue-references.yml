@@ -1,0 +1,148 @@
+name: Check issue references
+
+# Guards against a recurring incident: @semantic-release/github's `success` step
+# parses every released commit message and associated PR body with `issue-parser`,
+# and for each *unqualified* closing reference (e.g. "Fixes #17463") queries
+# `issueOrPullRequest(number: N)` against the repo being released — uncaught, so an
+# unresolvable number kills the whole release job. This asks the same question at
+# PR time and fails the check instead.
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: >-
+          PR to check. Defaults to the PR that triggered the calling workflow.
+        type: number
+        required: false
+      check-commits:
+        description: >-
+          Also scan the PR's individual commit messages (needed if the repo
+          squash-merges with commit messages included in the merge commit body).
+        type: boolean
+        required: false
+        default: true
+      issue-parser-version:
+        description: Version of issue-parser to use — keep in sync with what
+          @semantic-release/github resolves, for exact behavioural parity.
+        type: string
+        required: false
+        default: 7.0.1
+
+jobs:
+  check:
+    name: Closing issue references resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Install issue-parser
+        working-directory: ${{ runner.temp }}
+        run: |
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --loglevel=error \
+            "issue-parser@${{ inputs.issue-parser-version }}"
+
+      - name: Verify closing references resolve in ${{ github.repository }}
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
+          CHECK_COMMITS: ${{ inputs.check-commits }}
+        with:
+          script: |
+            const path = require('path');
+            const issueParser = require(
+              path.join(process.env.RUNNER_TEMP, 'node_modules', 'issue-parser')
+            );
+
+            const parse = issueParser('github');
+            const {owner, repo} = context.repo;
+            const slug = `${owner}/${repo}`;
+            const prNumber = Number(process.env.PR_NUMBER);
+
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed(
+                'No pull request number available. Call this workflow from a ' +
+                '`pull_request` event, or pass the `pr-number` input.'
+              );
+              return;
+            }
+
+            const {data: pr} = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+
+            const sources = [
+              {where: 'PR title', text: pr.title},
+              {where: 'PR body', text: pr.body},
+            ];
+
+            if (process.env.CHECK_COMMITS === 'true') {
+              const commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner, repo, pull_number: prNumber, per_page: 100,
+              });
+              for (const c of commits) {
+                sources.push({where: `commit ${c.sha.slice(0, 7)}`, text: c.commit.message});
+              }
+            }
+
+            // Mirrors @semantic-release/github lib/success.js exactly: only
+            // actions.close is used, and a ref is checked against THIS repo when
+            // it has no slug, or the slug is this repo.
+            const refs = [];
+            for (const {where, text} of sources) {
+              if (!text) continue;
+              for (const action of parse(text).actions.close) {
+                const qualified = action.slug ? action.slug.toLowerCase() : null;
+                if (qualified === null || qualified === slug.toLowerCase()) {
+                  refs.push({where, raw: action.raw.trim(), number: Number.parseInt(action.issue, 10)});
+                }
+              }
+            }
+
+            if (refs.length === 0) {
+              core.info(`No closing issue references found in ${slug}#${prNumber}.`);
+              return;
+            }
+
+            const numbers = [...new Set(refs.map(r => r.number))];
+            const query = `query($owner: String!, $repo: String!) {
+              repository(owner: $owner, name: $repo) {
+                ${numbers.map(n => `ref${n}: issueOrPullRequest(number: ${n}) { __typename }`).join('\n                ')}
+              }
+            }`;
+
+            let repository;
+            try {
+              ({repository} = await github.graphql(query, {owner, repo}));
+            } catch (error) {
+              if (!error.data) throw error;
+              ({repository} = error.data);
+            }
+
+            const missing = new Set(numbers.filter(n => repository?.[`ref${n}`] == null));
+
+            if (missing.size === 0) {
+              core.info(`All ${numbers.length} closing reference(s) resolve in ${slug}.`);
+              return;
+            }
+
+            const bad = refs.filter(r => missing.has(r.number));
+            for (const r of bad) {
+              core.error(
+                `"${r.raw}" (${r.where}) closes #${r.number}, which does not exist in ${slug}. ` +
+                `Once this reaches the release branch, @semantic-release/github will abort the ` +
+                `release job with "Could not resolve to an issue or pull request with the number ` +
+                `of ${r.number}." Fix it by fully qualifying the other repo (e.g. ` +
+                `${owner}/#${r.number} — note a bare "reponame#${r.number}" short form is ` +
+                `NOT recognised by GitHub or by semantic-release), or, if this PR doesn't actually ` +
+                `close it, drop the closing keyword and write it as a plain mention instead.`,
+                {title: `Unresolvable closing reference #${r.number}`}
+              );
+            }
+
+            core.setFailed(
+              `${bad.length} closing issue reference(s) do not resolve in ${slug}. See annotations above.`
+            );

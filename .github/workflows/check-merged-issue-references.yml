@@ -1,0 +1,175 @@
+name: Check merged issue references
+
+# Post-merge backstop for the same crash check-issue-references.yml guards
+# against at PR time: developers routinely hand-edit the squash-merge commit
+# message, so the PR-time check is only a best-effort prediction and can't be
+# authoritative. This runs against the commit that actually landed — the same
+# data @semantic-release/github's `success` step will eventually use — the
+# moment it lands on a squash-merge target branch, since that's the one point
+# where the message is fixed for good (later integration merges carry it
+# forward unchanged). It can't block anything (the commit already exists by
+# the time this runs); it notifies instead.
+
+on:
+  workflow_call:
+    inputs:
+      issue-parser-version:
+        description: Version of issue-parser to use — keep in sync with what
+          @semantic-release/github resolves, for exact behavioural parity.
+        type: string
+        required: false
+        default: 7.0.1
+      notify:
+        description: >-
+          Space-separated @mentions (users and/or teams) to include on the
+          PR comment when a bad reference is found, in addition to the PR
+          author.
+        type: string
+        required: false
+        default: '@5app/devs'
+
+jobs:
+  check:
+    name: Merged commit references resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Install issue-parser
+        working-directory: ${{ runner.temp }}
+        run: |
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --loglevel=error \
+            "issue-parser@${{ inputs.issue-parser-version }}"
+
+      - name: Verify merged commit references resolve in ${{ github.repository }}
+        uses: actions/github-script@v7
+        env:
+          NOTIFY: ${{ inputs.notify }}
+        with:
+          script: |
+            const path = require('path');
+            const issueParser = require(
+              path.join(process.env.RUNNER_TEMP, 'node_modules', 'issue-parser')
+            );
+
+            const parse = issueParser('github');
+            const {owner, repo} = context.repo;
+            const slug = `${owner}/${repo}`;
+            const STATUS_CONTEXT = 'issue-references (merged)';
+            const MARKER = '[unresolvable-issue-reference]';
+
+            function extractRefs(where, text) {
+              if (!text) return [];
+              const refs = [];
+              for (const action of parse(text).actions.close) {
+                const qualified = action.slug ? action.slug.toLowerCase() : null;
+                if (qualified === null || qualified === slug.toLowerCase()) {
+                  refs.push({where, raw: action.raw.trim(), number: Number.parseInt(action.issue, 10)});
+                }
+              }
+              return refs;
+            }
+
+            async function findMissing(numbers) {
+              if (numbers.length === 0) return new Set();
+              const query = `query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  ${numbers.map(n => `ref${n}: issueOrPullRequest(number: ${n}) { __typename }`).join('\n                  ')}
+                }
+              }`;
+              let repository;
+              try {
+                ({repository} = await github.graphql(query, {owner, repo}));
+              } catch (error) {
+                if (!error.data) throw error;
+                ({repository} = error.data);
+              }
+              return new Set(numbers.filter(n => repository?.[`ref${n}`] == null));
+            }
+
+            const shas = context.payload.commits?.length
+              ? context.payload.commits.map(c => c.id)
+              : [context.payload.after];
+
+            for (const sha of shas) {
+              const {data: statuses} = await github.rest.repos.listCommitStatusesForRef({
+                owner, repo, ref: sha,
+              });
+              if (statuses.some(s => s.context === STATUS_CONTEXT)) {
+                core.info(`${sha} already checked, skipping.`);
+                continue;
+              }
+
+              const {data: fullCommit} = await github.rest.repos.getCommit({owner, repo, ref: sha});
+              if (fullCommit.parents.length !== 1) {
+                core.info(`${sha} is a merge commit, skipping (not newly authored content).`);
+                continue;
+              }
+
+              const sources = [{where: 'commit message', text: fullCommit.commit.message}];
+
+              const {data: prs} = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner, repo, commit_sha: sha,
+              });
+              const pr = prs[0];
+              if (pr) {
+                sources.push({where: 'associated PR body', text: pr.body});
+              }
+
+              const refs = sources.flatMap(({where, text}) => extractRefs(where, text));
+              const numbers = [...new Set(refs.map(r => r.number))];
+              const missing = await findMissing(numbers);
+
+              if (missing.size === 0) {
+                await github.rest.repos.createCommitStatus({
+                  owner, repo, sha,
+                  state: 'success',
+                  context: STATUS_CONTEXT,
+                  description: 'All closing references resolve.',
+                });
+                continue;
+              }
+
+              const bad = refs.filter(r => missing.has(r.number));
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha,
+                state: 'failure',
+                context: STATUS_CONTEXT,
+                description: `${bad.length} closing reference(s) do not resolve.`,
+              });
+
+              const lines = bad.map(r =>
+                `- "${r.raw}" (${r.where}) closes #${r.number}, which does not exist in ${slug}.`
+              );
+              const body = `${MARKER} The commit that landed on \`${context.ref.replace('refs/heads/', '')}\` ` +
+                `(${sha.slice(0, 7)}) references an issue that doesn't exist in ${slug}:\n\n` +
+                lines.join('\n') + '\n\n' +
+                `Once this reaches \`main\`, @semantic-release/github will abort the release job with ` +
+                `"Could not resolve to an issue or pull request with the number of ${bad[0].number}." ` +
+                `The commit itself can't be edited retroactively without rewriting history, so this needs ` +
+                `a deliberate decision on how to handle it before the next release ` +
+                `(fully qualify the other repo as \`owner/repo#N\` in a follow-up commit that removes the ` +
+                `closing keyword, or just be aware the release job will need that reference ignored).`;
+
+              if (pr) {
+                const mentions = [...new Set([...NOTIFY.split(/\s+/).filter(Boolean), `@${pr.user.login}`])];
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pr.number,
+                  body: `${mentions.join(' ')}\n\n${body}`,
+                });
+              } else {
+                const mentions = [...new Set([
+                  ...NOTIFY.split(/\s+/).filter(Boolean),
+                  ...(fullCommit.author?.login ? [`@${fullCommit.author.login}`] : []),
+                ])];
+                core.warning(`${sha} has unresolvable reference(s) but no associated PR to comment on.`);
+                await github.rest.repos.createCommitComment({
+                  owner, repo, commit_sha: sha,
+                  body: `${mentions.join(' ')}\n\n${body}`,
+                });
+              }
+            }
