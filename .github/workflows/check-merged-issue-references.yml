@@ -156,14 +156,14 @@ jobs:
                 `closing keyword, or just be aware the release job will need that reference ignored).`;
 
               if (pr) {
-                const mentions = [...new Set([...NOTIFY.split(/\s+/).filter(Boolean), `@${pr.user.login}`])];
+                const mentions = [...new Set([...process.env.NOTIFY.split(/\s+/).filter(Boolean), `@${pr.user.login}`])];
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: pr.number,
                   body: `${mentions.join(' ')}\n\n${body}`,
                 });
               } else {
                 const mentions = [...new Set([
-                  ...NOTIFY.split(/\s+/).filter(Boolean),
+                  ...process.env.NOTIFY.split(/\s+/).filter(Boolean),
                   ...(fullCommit.author?.login ? [`@${fullCommit.author.login}`] : []),
                 ])];
                 core.warning(`${sha} has unresolvable reference(s) but no associated PR to comment on.`);
